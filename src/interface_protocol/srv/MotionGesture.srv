@@ -1,0 +1,19 @@
+# Motion gesture service definition.
+# Used to trigger traffic-police gestures on the robot.
+#
+# gesture_id mapping:
+#   0 = 归位 (lower arms to neutral)
+#   1 = 停止 (stop)
+#   2 = 直行 (proceed)
+#   3 = 左转弯 (left turn)
+#   4 = 左转弯待转 (left turn wait)
+#   5 = 右转弯 (right turn)
+#   6 = 变道 (lane change)
+#   7 = 减速慢行 (slow down)
+#   8 = 靠边停车 (pull over)
+
+uint8  gesture_id
+
+---
+bool   success
+string message

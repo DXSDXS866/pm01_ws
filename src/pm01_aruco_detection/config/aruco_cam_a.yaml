@@ -1,0 +1,10 @@
+aruco_detector:
+  ros__parameters:
+    image_topic: /camera/color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    dictionary: DICT_4X4_50
+    target_id: 23
+    marker_size_m: 0.074
+    image_timeout_sec: 0.5
+    publish_debug_image: true
+    axis_length_m: 0.100

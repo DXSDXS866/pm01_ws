@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# 运行时必须能看到 user-site(pycuda/numpy 1.26.4 在 ~/.local);PYTHONNOUSERSITE
+# 只属于 colcon test 的终端。这里无条件清掉,保证任何启动方式都干净。
+unset PYTHONNOUSERSITE
+exec /usr/bin/python3 \
+  -m yolo_person_3d.person_3d_node "$@"

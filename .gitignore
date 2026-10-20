@@ -1,0 +1,26 @@
+# colcon 构建产物
+/build/
+/install/
+/log/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# 运行时日志与临时文件
+*.log
+.env
+.env.*
+
+# 本机临时笔记
+/1

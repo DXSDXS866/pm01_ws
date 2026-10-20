@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>pm01_camera_bringup</name>
+  <version>0.1.0</version>
+  <description>Realsense D435i camera bringup for the PM01 visual stack; align_depth enabled and baked in.</description>
+  <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
+  <license>TODO: License declaration</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>realsense2_camera</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
