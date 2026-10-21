@@ -69,32 +69,29 @@ PM01 人形机器人把语音交互、视觉感知和运动控制分散在多个
 
 ```mermaid
 flowchart LR
-    subgraph Voice["语音链路"]
-        direction LR
+    subgraph Voice["🎙️ 语音链路"]
         MIC["🎤 麦克风"] --> VAD["🔇 VAD 断句"]
         VAD --> ASR["📝 Paraformer ASR"]
-        ASR --> LLM["🧠 Qwen<br/>Function Call"]
+        ASR --> LLM["🧠 Qwen Function Call"]
         LLM --> TTS["🔊 CosyVoice TTS"]
         TTS --> SPK["📢 扬声器"]
     end
 
-    subgraph Perception["感知链路"]
-        direction LR
-        CAM["📷 RealSense D435i"] --> YOLO["👁️ YOLO26n<br/>TensorRT"]
-        YOLO --> LOCK["🎯 单人锁定<br/>HSV 衣着特征"]
+    subgraph Perception["👁️ 感知链路"]
+        CAM["📷 RealSense D435i"] --> YOLO["👁️ YOLO26n TensorRT"]
+        YOLO --> LOCK["🎯 单人锁定（HSV 衣着特征）"]
     end
 
-    subgraph Control["跟随控制"]
-        direction LR
+    subgraph Control["🕹️ 跟随控制"]
         CTRL["🎮 person_follow_controller"] --> SAFE["🛡️ cmd_vel_safety_bridge"]
     end
 
-    LLM -.->|工具调用| BRIDGE["voice_node / motion_bridge"]
-    BRIDGE -.->|/person/set_target| LOCK
-    BRIDGE -.->|/vision_follow/set_follow| SAFE
-    LOCK -->|/person/position_robot<br/>/person/detected| CTRL
-    SAFE -->|/cmd_vel| MOTION["🦿 pm01_edu<br/>运控主机"]
-    BRIDGE -->|walk / gesture / switch_motion| MOTION
+    LLM -.->|工具调用| BRIDGE["voice_node + motion_bridge"]
+    BRIDGE -.->|set_target| LOCK
+    BRIDGE -.->|set_follow| SAFE
+    LOCK -->|位置与检测状态| CTRL
+    SAFE -->|cmd_vel| MOTION["🦿 pm01_edu 运控主机"]
+    BRIDGE -->|动作与手势| MOTION
 ```
 
 **设计原则**
