@@ -1,20 +1,33 @@
-# voice_interaction — PM01 语音交互 ROS2 包
+# 🎙️ voice_interaction — PM01 语音交互 ROS 2 包
 
 PM01-EDU 人形机器人的语音交互节点，部署在机器人计算单元（Jetson Orin NX）。
-对话+动作联动：阿里通义 ASR/LLM/TTS 全云端，LLM function call 通过 ROS2 控制机器人动作。
 
-## 依赖
+一条链路打通 **语音 → 意图 → 动作 → 语音回复**：
 
-- 机器人计算单元上的 ROS2 Humble 环境（机器人自带）
-- `interface_protocol` msg 包（编译 Native SDK 时自动生成，路径 `engineai_robotics_native_sdk/src/protocol/interface_protocol`）
-- Python 依赖：`dashscope` `pyaudio` `numpy`，可选 `webrtcvad`
-- `ffmpeg`（含 ffplay，用于整段 MP3 播放回退路径）：`sudo apt install ffmpeg`
-- `mpg123`（推荐，用于流式 TTS 首包即播）：`sudo apt install mpg123`
-- 阿里云 DashScope API Key
+- **听**：本地麦克风 + 能量 VAD + 阿里 Paraformer 流式 ASR
+- **想**：Qwen function call 解析意图（默认 `qwen-flash`，低延迟）
+- **做**：`MotionBridge` 把工具调用翻译成 ROS 2 运控指令
+- **说**：CosyVoice 流式 TTS，首包即播（`mpg123`），支持唤醒词打断
 
-## 目录结构
+> [!WARNING]
+> 本包会控制真实机器人。真机测试前请确认机器人有支撑、周围清空、急停可用。
 
+## 📦 依赖
+
+- ROS 2 Humble（机器人计算单元自带）
+- `interface_protocol` 消息包（本仓库 `src/interface_protocol`，或 Native SDK 自带版本）
+- Python：`dashscope`、`pyaudio`、`numpy<2`；可选 `webrtcvad`
+- 系统：`mpg123`（流式 TTS）、`ffmpeg`（回退播放）、`alsa-utils`
+- 阿里云 DashScope API Key：`DASHSCOPE_API_KEY`
+
+```bash
+sudo apt install mpg123 ffmpeg alsa-utils
+pip3 install 'numpy<2' dashscope pyaudio sounddevice
 ```
+
+## 🗂️ 目录结构
+
+```text
 voice_interaction/
 ├── package.xml
 ├── setup.py / setup.cfg
@@ -22,124 +35,129 @@ voice_interaction/
 ├── launch/voice_interaction.launch.py
 ├── config/params.yaml
 ├── README.md
+├── docs/技术文档.md
 └── voice_interaction/
     ├── __init__.py
-    ├── voice_node.py       主节点（状态机：IDLE→RECORDING→PROCESSING）
-    ├── audio_io.py         麦克风采集 + 扬声器播放（支持打断）
-    ├── vad.py              VAD 断句（能量阈值，可选 webrtcvad）
-    ├── asr_client.py       阿里 Paraformer 流式 ASR
-    ├── llm_client.py       Qwen function call + 对话历史
-    ├── tts_client.py       阿里 CosyVoice 流式 TTS
-    └── motion_bridge.py    ROS2 动作桥（walk持续发/switch_motion/wave_hand/emergency_stop）
+    ├── voice_node.py        # 主节点（IDLE → RECORDING → PROCESSING）
+    ├── audio_io.py          # 麦克风采集 + 扬声器播放（支持打断）
+    ├── vad.py               # VAD 断句（能量阈值，可选 webrtcvad）
+    ├── asr_client.py        # Paraformer 流式 ASR
+    ├── llm_client.py        # Qwen function call + 对话历史
+    ├── tts_client.py        # CosyVoice 流式 TTS
+    ├── media_player.py      # 本地提示音播放
+    └── motion_bridge.py     # ROS 2 动作桥
 ```
 
-## 部署步骤
+## 🚀 在统一工作区中运行（推荐）
 
-### 1. 拷包到机器人计算单元
-
-把整个 `voice_interaction/` 目录拷到机器人的工作区：
+本包已包含在 `pm01_ws` 中，不需要单独拷贝：
 
 ```bash
-# 在你的 PC 上（假设能 ssh 机器人）
-scp -r voice_interaction/ ubuntu@<robot-ip>:~/voice_interaction_ws/src/
-
-# 或者用 U盘 / 共享文件夹
+cd ~/pm01_ws
+./build.sh --packages-select voice_interaction
+export DASHSCOPE_API_KEY='...'
+./run_voice.sh
 ```
 
-### 2. 确保 interface_protocol 可被本包依赖
+`run_voice.sh` 会：
 
-`interface_protocol` 是 Native SDK 的 ROS2 msg 包。两种方式让本包能找到它：
+1. `source env.sh` 加载工作区环境；
+2. 检查 `DASHSCOPE_API_KEY`；
+3. 打印实际加载的 `llm_client` 路径，确认不是旧工作区；
+4. 启动 `voice_interaction` 节点。
 
-**方式A（推荐）**：把 `engineai_robotics_native_sdk/src/protocol/interface_protocol` 也拷到同一个工作区一起编译：
-```bash
-cp -r ~/engineai_robotics_native_sdk/src/protocol/interface_protocol ~/voice_interaction_ws/src/
-```
-
-**方式B**：先在 Native SDK 容器里 `./build.sh`，再 `source build/ros2_env/install/setup.bash`，本包编译时就能找到已生成的 msg。
-
-### 3. 装依赖
+手动启动：
 
 ```bash
-ssh ubuntu@<robot-ip>
-pip3 install dashscope pyaudio numpy webrtcvad
-sudo apt install ffmpeg
-# 确认麦克风
-arecord -l
-```
-
-### 4. 配置 API Key
-
-```bash
-echo 'export DASHSCOPE_API_KEY=sk-你的key' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### 5. 编译运行
-
-```bash
-cd ~/voice_interaction_ws
-# ROS2 环境
-source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=69
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-
-colcon build --packages-select voice_interaction
-source install/setup.bash
-
-# 启动
+source ./env.sh
 ros2 launch voice_interaction voice_interaction.launch.py
 ```
 
-### 6. 测试
+## 🧰 独立部署（可选）
 
-启动后节点持续监听。对机器人说话试试：
-- "你好" → 闲聊回复
-- "向前走" → walk(0.3, 0, 0) + 机器人前进（需先 pd_stand→rl_basic）
-- "停" → walk(0,0,0)
-- "挥手" → wave_hand（需先 lower_body_balance）
-- "急停" → emergency_stop → passive
+如果只想把本包放进一个独立工作区：
 
-## 参数调优（config/params.yaml）
+```bash
+# 1. 拷包
+scp -r voice_interaction/ ubuntu@<robot-ip>:~/voice_interaction_ws/src/
 
-| 参数 | 说明 | 调优建议 |
-|------|------|---------|
-| energy_threshold | VAD 能量阈值 | 先录环境噪声，设为其 RMS 的 2~3 倍。误触发就调高，听不到就调低 |
-| silence_ms | 句尾静音时长 | 默认 450；说话慢的人调大(800~1000)，想更快响应可再调小 |
-| mic_device_index | 麦克风索引 | -1=默认；`python3 -m sounddevice` 查列表 |
-| llm_model | LLM 模型 | 默认 qwen-flash（低延迟）；复杂问答可换 qwen-plus/qwen-max |
-| tts_voice | 发音人 | 换 tts_model 必须同步换 voice |
-| tts_streaming | 流式 TTS 播放 | 默认 true，首包即播；无 mpg123 或想回退旧行为时设 false |
+# 2. 同时放入 interface_protocol
+cp -r ~/engineai_robotics_native_sdk/src/protocol/interface_protocol \
+      ~/voice_interaction_ws/src/
 
-## 动作接口（motion_bridge.py）
+# 3. 构建
+cd ~/voice_interaction_ws
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=69
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+colcon build --packages-select voice_interaction
+source install/setup.bash
+ros2 launch voice_interaction voice_interaction.launch.py
+```
 
-| 工具 | ROS2 Topic | msg | 状态前置 |
-|------|-----------|-----|---------|
-| walk | /motion/body_vel_cmd | BodyVelCmd | rl_basic/rl_amp/rl_terrain（10Hz持续发） |
-| switch_motion | /motion/set_motion_state | MotionStateRequest | 在 available_transition_motions 内 |
-| wave_hand | /motion/joint_override_command | JointOverrideCommand | lower_body_balance |
-| emergency_stop | /motion/set_motion_state | MotionStateRequest | 任意→passive |
+## 🎛️ 参数调优
 
-## 常见问题
+`config/params.yaml`：
 
-**Q: 编译报找不到 interface_protocol？**
-A: 按"部署步骤2"把 interface_protocol 放进工作区，或 source Native SDK 的 ros2_env。
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `energy_threshold` | 500 | VAD 能量阈值。先录环境噪声，设为其 RMS 的 2~3 倍 |
+| `silence_ms` | 450 | 句尾静音时长。说话慢可调到 800~1000；句子常被截断也调大 |
+| `mic_device_index` | -1 | 麦克风索引，-1=系统默认；`python3 -m sounddevice` 查看 |
+| `llm_model` | qwen-flash | 低延迟默认；复杂问答可换 qwen-plus / qwen-max |
+| `tts_model` | cosyvoice-v2 | **换 voice 必须同步换 model** |
+| `tts_voice` | longshu_v2 | 温暖男声；v2 下可选 `longxiang_v2` / `longxiaochen_v2` 等 |
+| `tts_streaming` | true | 首包即播；无 `mpg123` 或想回退旧行为时设 false |
 
-**Q: ASR 无结果？**
-A: 检查 DASHSCOPE_API_KEY 环境变量；`arecord test.wav` 确认麦克风有声；调低 energy_threshold。
+命令行临时覆盖：
 
-**Q: TTS 无声？**
-A: 确认装了 `mpg123`（流式）和 `ffmpeg`（回退路径）；cosyvoice-v3-flash 的 voice 必须是 longanhuan。
+```bash
+ros2 launch voice_interaction voice_interaction.launch.py silence_ms:=600
+```
 
-**Q: 机器人不动？**
-A: `ros2 topic echo /motion/motion_state` 看当前状态；walk 需先 pd_stand 再 rl_basic；检查 ROS_DOMAIN_ID=69。
+## 🔌 动作与跟随接口
 
-**Q: 误触发太多？**
-A: 调高 energy_threshold；或加唤醒词（后续可集成 porcupene）。
+| 工具 | ROS 2 接口 | 说明 |
+|---|---|---|
+| `walk` | `/motion/body_vel_cmd`（`BodyVelCmd`） | 需运控处于支持的行走态，100 Hz 持续发 |
+| `switch_motion` | `/motion/set_motion_state`（`MotionStateRequest`） | 状态必须在 `available_transition_motions` 内 |
+| `wave_hand` | `/motion/joint_override_command` | 需 `lower_body_balance` |
+| `gesture` | `/motion/gesture`（服务） | 交警手势 0–8 |
+| `emergency_stop` | `/motion/set_motion_state` | 任意状态 → `passive` |
+| `set_follow` | `/vision_follow/set_follow` + `/person/set_target` | 锁定单人并跟随 |
+| `relock_target` | `/person/set_target` | 重新选择跟随目标 |
 
-## 安全提示
+## 🎤 测试口令
 
-- 真机测试先吊架或空旷场地，walk 速度从 0.1m/s 开始
-- emergency_stop 随时可用，会立即切 passive
-- walk 有 2s 超时保护，但停步建议主动发 walk(0,0,0)
+启动后先说唤醒词 **“你好小智”**，再说：
+
+| 口令 | 预期 |
+|---|---|
+| “你好小智，跟着我” | 锁定正前方的人并开始跟随 |
+| “重新锁定” | 跟随中重新选人 |
+| “停止跟随” | 解除锁定并停车站立 |
+| “挥挥手” | `wave_hand`（需先站立/平衡态） |
+| “做个停止手势” | 交警手势 1 |
+| “急停” | `emergency_stop` → `passive` |
+| “你好” | 普通闲聊（LLM 回复） |
+
+> 本机主要行走方式是视觉跟随；`walk` 工具保留，但默认提示词优先使用 `set_follow`。
+
+## 🩺 常见问题
+
+| 问题 | 排查 |
+|---|---|
+| 编译找不到 `interface_protocol` | 按「独立部署」把 msg 包放进工作区，或先 source Native SDK 的 `ros2_env` |
+| ASR 无结果 | 检查 `DASHSCOPE_API_KEY`；`arecord test.wav` 确认麦克风有声；调低 `energy_threshold` |
+| TTS 无声 | 确认 `mpg123` / `ffmpeg` 已安装；`cosyvoice-v2` 必须配 `*_v2` voice；看日志“TTS 首音” |
+| 机器人不动 | 先跑 `./motion_up.sh --check`（`pm01_edu` 的状态从远端日志读）；确认已到 `walk`；再看 `/vision_follow/safety_bridge_status`；检查 `ROS_DOMAIN_ID=69` |
+| 误触发太多 | 调高 `energy_threshold`；缩短唤醒窗口；后续可接入专用 KWS 引擎 |
+| 打断不生效 | 确认调的是 `TTSClient.stop()`，不是只调 `SpeakerPlayer.stop()` |
+
+## 🛡️ 安全提示
+
+- 真机测试先吊架或空旷场地，速度从低速开始
+- `emergency_stop` 随时可用，会立即切 `passive`
+- `walk` 没有自动超时，停步必须主动发停止指令或切状态
 - 麦克风持续监听，注意隐私（云端 ASR 会上传音频）
+- 不要把 `DASHSCOPE_API_KEY` 写入仓库或脚本

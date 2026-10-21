@@ -1552,7 +1552,7 @@ class VoiceInteractionNode(Node):
         # voice_interaction/
         # ├── voice_node.py
         # └── media/
-        #     └── 1.mp3
+        #     └── <提示音>.mp3
         # ====================================================
 
         package_media = os.path.join(
