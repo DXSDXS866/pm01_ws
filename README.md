@@ -67,32 +67,15 @@ PM01 人形机器人把语音交互、视觉感知和运动控制分散在多个
 
 ## 🧠 系统架构
 
-```mermaid
-flowchart LR
-    subgraph Voice["🎙️ 语音链路"]
-        MIC["🎤 麦克风"] --> VAD["🔇 VAD 断句"]
-        VAD --> ASR["📝 Paraformer ASR"]
-        ASR --> LLM["🧠 Qwen Function Call"]
-        LLM --> TTS["🔊 CosyVoice TTS"]
-        TTS --> SPK["📢 扬声器"]
-    end
+> [!NOTE]
+> 下表按“语音 / 感知 / 跟随”三条链路展示主要数据流；完整话题列表见[接口速查](#sec-interfaces)。
 
-    subgraph Perception["👁️ 感知链路"]
-        CAM["📷 RealSense D435i"] --> YOLO["👁️ YOLO26n TensorRT"]
-        YOLO --> LOCK["🎯 单人锁定（HSV 衣着特征）"]
-    end
-
-    subgraph Control["🕹️ 跟随控制"]
-        CTRL["🎮 person_follow_controller"] --> SAFE["🛡️ cmd_vel_safety_bridge"]
-    end
-
-    LLM -.->|工具调用| BRIDGE["voice_node + motion_bridge"]
-    BRIDGE -.->|set_target| LOCK
-    BRIDGE -.->|set_follow| SAFE
-    LOCK -->|位置与检测状态| CTRL
-    SAFE -->|cmd_vel| MOTION["🦿 pm01_edu 运控主机"]
-    BRIDGE -->|动作与手势| MOTION
-```
+| 链路 | 数据流 |
+|---|---|
+| 🎙️ 语音 | 🎤 麦克风 → 🔇 VAD 断句 → 📝 Paraformer ASR → 🧠 Qwen Function Call → 🔊 CosyVoice TTS → 📢 扬声器 |
+| 👁️ 感知 | 📷 RealSense D435i → 👁️ YOLO26n（TensorRT）→ 🎯 单人锁定（HSV 衣着特征）→ `/person/position_robot` + `/person/detected` |
+| 🕹️ 跟随 | `person_follow_controller` → `/vision_follow/cmd_vel` → 🛡️ `cmd_vel_safety_bridge` → `/cmd_vel` → 🦿 `pm01_edu` |
+| 🔗 联动 | Qwen 工具调用 → `voice_node` / `motion_bridge` → `/person/set_target`、`/vision_follow/set_follow`、动作/手势 |
 
 **设计原则**
 
