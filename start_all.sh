@@ -5,9 +5,14 @@
 # 拉起:
 #   0. .163 运控: 停 pm_v2 → 启动 pm01_edu
 #      → idle → passive → pd_stand → walk → 校验 /cmd_vel
-#   1. 相机 + YOLO          (~/pm01_ws/src/yolo_person_3d)
-#   2. 跟随控制 + 安全桥    armed=true
+#   1. 相机 + YOLO          (~/pm01_ws/src/yolo_person_3d, require_lock=true)
+#   2. 跟随控制 + 安全桥    armed=true（未锁定前感知不发目标，机器人不动）
 #   3. 语音交互
+#
+# 锁定跟随:
+#   启动后不会自动跟人。说“你好小智，跟着我”锁定正前方的人；
+#   目标被挡住/走出画面会立即停下等待，不会改跟别人；
+#   说“重新锁定”可换人，说“停止跟随”解除锁定。
 #
 # 用法:
 #   ~/pm01_ws/start_all.sh              # 交互确认后启动
@@ -40,9 +45,13 @@ PM01 一键启动（使用 ~/pm01_ws）
 拉起:
   0. .163 运控: 停 pm_v2 → 启动 pm01_edu
      → idle → passive → pd_stand → walk → 校验 /cmd_vel
-  1. 相机 + YOLO          (~/pm01_ws/src/yolo_person_3d)
-  2. 跟随控制 + 安全桥    armed=true
+  1. 相机 + YOLO          (~/pm01_ws/src/yolo_person_3d, require_lock=true)
+  2. 跟随控制 + 安全桥    armed=true（未锁定前不发目标）
   3. 语音交互
+
+锁定跟随:
+  启动后不会自动跟人。说“你好小智，跟着我”锁定正前方的人；
+  目标被挡住/走出画面会立即停下等待，不会改跟别人。
 
 用法:
   ~/pm01_ws/start_all.sh              # 交互确认后启动
@@ -128,13 +137,14 @@ if [ "$ASSUME_YES" -ne 1 ]; then
     else
         echo ">>   [0] 跳过 .163 启动，仅校验现有 walk 运控"
     fi
-    echo ">>   [1] 相机 + YOLO"
-    echo ">>   [2] 跟随控制 (armed=true)"
+    echo ">>   [1] 相机 + YOLO（严格锁定模式）"
+    echo ">>   [2] 跟随控制 (armed=true，但未说“跟着我”不会发目标)"
     echo ">>   [3] 语音交互"
     echo ">> 请确认:"
     echo ">>   - 机器人已趴下/有支撑，周围清空，急停可用；"
     echo ">>   - passive 会松关节，pd_stand 会站起，walk 会进入行走控制；"
-    echo ">>   - 人先离开机器人正前方。"
+    echo ">>   - 人先离开机器人正前方；"
+    echo ">>   - 启动后必须语音说“跟着我”才会开始跟随，目标丢失会停下等待。"
     read -r -p ">> 输入 yes 继续: " answer
     if [ "$answer" != "yes" ]; then
         echo ">> 已取消。"
@@ -177,8 +187,9 @@ fi
 # [1] 感知
 # ------------------------------------------------------------
 
-echo ">> [1/3] 感知(相机+YOLO)... 日志: $LOG_DIR/vision.log"
-ros2 launch yolo_person_3d bringup.launch.py > "$LOG_DIR/vision.log" 2>&1 &
+echo ">> [1/3] 感知(相机+YOLO, require_lock=true)... 日志: $LOG_DIR/vision.log"
+ros2 launch yolo_person_3d bringup.launch.py require_lock:=true \
+    > "$LOG_DIR/vision.log" 2>&1 &
 PIDS+=($!)
 sleep 8   # 等 TensorRT engine 加载
 
@@ -200,7 +211,9 @@ echo ">> [3/3] 语音交互... 日志: $LOG_DIR/voice.log"
 "$HERE/run_voice.sh" > "$LOG_DIR/voice.log" 2>&1 &
 PIDS+=($!)
 
-echo ">> 全部启动完成。唤醒词: 你好小智 | 急停: 喊\"停止跟随\" 或 Ctrl+C"
+echo ">> 全部启动完成。唤醒词: 你好小智"
+echo ">> 锁定跟随: 说\"跟着我\"（未锁定前机器人不会跟人；目标丢失会停下等待）"
+echo ">> 急停: 喊\"停止跟随\" 或 Ctrl+C"
 echo ">> 日志: $LOG_DIR/{motion,vision,follow,voice}.log"
 
 wait || true

@@ -5,6 +5,7 @@
 - 语音唤醒 → 语音识别 → 大模型意图理解 → 语音合成
 - RealSense 相机 + YOLO26n（TensorRT）人员检测与 3D 定位
 - 人员跟随控制器 + 速度安全桥
+- 单人锁定跟随：说“跟着我”只跟指定的人，目标遮挡/出画立即停车等待，不换人
 - 远程启动运动控制主机上的 `pm01_edu`，按 `idle → passive → pd_stand → walk` 切状态
 - 语音控制跟随开关、行走、挥手、交警手势（0–8）
 
@@ -38,11 +39,14 @@
  麦克风 ──► VAD ──► ASR(dashscope) ──► LLM function call ──► TTS(dashscope) ──► 扬声器
                                              │
                                              ├── set_follow ──► /vision_follow/set_follow
+                                             ├── lock/relock ─► /person/set_target
                                              ├── walk / switch_motion / wave_hand
                                              └── gesture ─────► /motion/gesture
 
                  ┌──────────────────────────── 跟随链路 ────────────────────────────┐
- RealSense D435i ──► YOLO26n(TRT) ──► /person/position_robot
+ RealSense D435i ──► YOLO26n(TRT) ──► 单人锁定(HSV 衣着特征)
+                                             │
+                                   /person/position_robot
                                              │
                                    person_follow_controller
                                              │
@@ -58,7 +62,7 @@
 | `interface_protocol` | PM01 消息/服务定义，含 `MotionGesture.srv`、`BodyVelCmd.msg` 等 |
 | `voice_interaction` | 唤醒词、VAD、ASR、Qwen function call、TTS、动作桥 |
 | `pm01_camera_bringup` | RealSense D435i 启动（彩色 + 深度 + align_depth） |
-| `yolo_person_3d` | YOLO26n + TensorRT + pycuda，输出人员 3D 坐标 |
+| `yolo_person_3d` | YOLO26n + TensorRT + pycuda，单人锁定 + 人员 3D 坐标 |
 | `pm01_aruco_detection` | 人员跟随控制器、ArUco 检测、`/cmd_vel` 安全桥、手柄桥 |
 
 ---
@@ -187,11 +191,12 @@ export DASHSCOPE_API_KEY='...'
 /**:
   ros__parameters:
     energy_threshold: 500   # VAD 能量阈值（按现场噪声调）
-    silence_ms: 800         # 句尾静音判定
+    silence_ms: 450         # 句尾静音判定（400~500 响应快）
     mic_device_index: -1    # -1=系统默认；用 python3 -m sounddevice 查看
-    llm_model: qwen-plus    # qwen-turbo / qwen-plus / qwen-max
+    llm_model: qwen-flash   # 低延迟；复杂问答可换 qwen-plus / qwen-max
     tts_model: cosyvoice-v2 # 换 voice 必须同步换 model
     tts_voice: longshu_v2   # 可选 longxiang_v2 / longxiaochen_v2 等
+    tts_streaming: true     # 首包即播（需 mpg123）；false=整段合成后播放
 ```
 
 ### 相机与检测参数
@@ -204,6 +209,8 @@ export DASHSCOPE_API_KEY='...'
 - 跟随：`src/pm01_aruco_detection/launch/person_follow.launch.py`
   - 默认 `desired_distance_m=0.8`、`max_linear_mps=0.45`、`max_angular_rps=0.6`
   - `armed` 默认 `false`，一键启动脚本会显式传 `armed:=true`
+  - `require_lock` 默认 `true`：未收到“跟着我”的锁定命令前，感知不发目标；锁定后只跟该目标
+  - `stop_on_detected_false=true`：锁定目标丢失时控制器一帧内停车
 
 ---
 
@@ -218,8 +225,8 @@ export DASHSCOPE_API_KEY='...'
 启动顺序：
 
 0. SSH 到运控主机：停原厂 `robotics.service`（`pm_v2`）→ 启动 `pm01_edu` → 等 `/motion/motion_state` → 按 `idle → passive → pd_stand → walk` 切换 → 校验 `/cmd_vel` 有 `ros2_control_node` 订阅者
-1. 相机 + YOLO
-2. 跟随控制（`armed=true`）
+1. 相机 + YOLO（`require_lock=true`）
+2. 跟随控制（`armed=true`，但锁定前感知不发目标，机器人不动）
 3. 语音交互
 
 首次运行需要：计算单元到运控主机的免密 SSH；运控主机上的 sudo 密码（交互输入，不落盘）。
@@ -316,9 +323,11 @@ ros2 topic echo --once /vision_follow/cmd_vel
 |---|---|---|---|
 | `/camera/color/image_raw` | `sensor_msgs/Image` | 相机 → 检测 | 彩色图 |
 | `/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | 相机 → 检测 | 对齐深度 |
-| `/person/detected` | `std_msgs/Bool` | 检测 → 跟随 | 是否检测到人 |
+| `/person/detected` | `std_msgs/Bool` | 检测 → 跟随 | 是否存在**有效锁定目标** |
 | `/person/position_camera` | `geometry_msgs/PointStamped` | 检测 | 相机坐标系位置 |
-| `/person/position_robot` | `geometry_msgs/PointStamped` | 检测 → 跟随 | 机器人坐标系位置 |
+| `/person/position_robot` | `geometry_msgs/PointStamped` | 检测 → 跟随 | 锁定目标的机器人坐标系位置 |
+| `/person/set_target` | `std_msgs/String` | 语音 → 检测 | 锁定命令 `{"action":"lock|relock|unlock"}` |
+| `/person/status` | `std_msgs/String` | 检测 → 语音 | 锁定状态 JSON（`lock_state/lock_reason/generation`） |
 | `/vision_follow/set_follow` | `std_msgs/Bool` | 语音 → 跟随 | 跟随开关 |
 | `/vision_follow/status` | `std_msgs/String` | 跟随 | 状态 |
 | `/vision_follow/cmd_vel` | `geometry_msgs/Twist` | 跟随 → 安全桥 | 期望速度 |
@@ -343,14 +352,15 @@ ros2 topic echo --once /vision_follow/cmd_vel
 
 | 说法 | 动作 |
 |---|---|
-| 跟着我 | 打开跟随 |
-| 停止跟随 / 别跟着我 / 停下 | 关闭跟随并保持站立（安全指令，不经过 LLM） |
+| 跟着我 | 锁定正前方的人并开始跟随 |
+| 重新锁定 / 重新找我 / 重新跟着我 | 跟随中重新选人（安全指令，不经过 LLM） |
+| 停止跟随 / 别跟着我 / 停下 | 解除锁定、关闭跟随并保持站立（安全指令，不经过 LLM） |
 | 向前走 / 后退 | `walk` |
 | 站起来 / 趴下 | `switch_motion` |
 | 挥挥手 | `wave_hand` |
 | 做直行/左转弯/右转弯/停止的交警手势 | `gesture`（0=归位 1=停止 2=直行 3=左转弯 4=左转弯待转 5=右转弯 6=变道 7=减速慢行 8=靠边停车） |
 
-LLM 工具共 5 个：`walk`、`switch_motion`、`wave_hand`、`gesture`、`set_follow`（`emergency_stop` 会映射到 `set_follow(false)`）。
+LLM 工具共 7 个：`walk`、`switch_motion`、`wave_hand`、`gesture`、`emergency_stop`、`set_follow`、`relock_target`（直连模式下 `emergency_stop` 会映射到 `set_follow(false)`）。
 
 ---
 
@@ -401,6 +411,13 @@ colcon test --base-paths src \
 colcon test-result --verbose
 ```
 
+单人锁定纯逻辑自测（无需 ROS/相机）：
+
+```bash
+python3 src/yolo_person_3d/test/test_target_lock.py
+# ALL 12 TESTS PASSED
+```
+
 既有结果：`test_person_follow_control.py` 5/5、`test_pm01_gamepad_bridge.py` 4/4、
 `test_aruco_core.py` 3/6（3 个失败与 OpenCV 版本有关，见「已知问题」）。
 
@@ -421,6 +438,8 @@ colcon test-result --verbose
 | 状态卡在 `rl_basic` | 运控主机上还是 `pm_v2`；检查 `ps -ef | grep src_executor` |
 | `/cmd_vel` 没有 `ros2_control_node` 订阅者 | `pm01_edu` 未完整启动，或 `pm_v2` 仍在跑；跟随链路无效 |
 | 退出脚本后机器人还在 walk | 预期行为；按脚本提示切 `pd_stand` 或停止 `pm01_edu` |
+| 跟随中换人/被路人带走 | 确认 `require_lock:=true`；`ros2 topic echo /person/status` 看 `lock_state`（LOST 时机器人应停下等待） |
+| 目标丢失但机器人还在走 | 检查 `stop_on_detected_false`；控制器应在一帧内发 `STOP_TARGET_LOST` |
 | 构建失败 | 看 `log/latest_build/<pkg>/stderr.log` |
 
 ---
@@ -445,5 +464,6 @@ colcon test-result --verbose
 
 ## 相关文档
 
+- 单人锁定跟随技术文档：`技术文档-单人锁定跟随.md`
 - 语音实现细节：`src/voice_interaction/docs/技术文档.md`
 - 语音包 README：`src/voice_interaction/README.md`

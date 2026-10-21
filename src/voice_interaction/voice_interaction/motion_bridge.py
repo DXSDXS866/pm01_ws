@@ -17,6 +17,7 @@
 - emergency_stop 才发送 0 速度并切 passive。
 """
 
+import json
 import threading
 import time
 
@@ -30,7 +31,7 @@ from interface_protocol.msg import (
     JointOverrideCommand,
 )
 from interface_protocol.srv import MotionGesture
-from std_msgs.msg import Bool, Header
+from std_msgs.msg import Bool, Header, String
 
 
 # ============================================================
@@ -193,6 +194,14 @@ class MotionBridge:
         self._follow_pub = node.create_publisher(
             Bool,
             '/vision_follow/set_follow',
+            10,
+        )
+
+        # 单人锁定（跟随侧 person_3d_node 订阅）
+        # lock=锁定正前方的人, relock=重新选人, unlock=解除锁定
+        self._target_pub = node.create_publisher(
+            String,
+            '/person/set_target',
             10,
         )
 
@@ -381,6 +390,9 @@ class MotionBridge:
 
             elif name == 'set_follow':
                 self._do_set_follow(args)
+
+            elif name == 'relock_target':
+                self.set_target_action('relock')
 
             else:
                 self.logger.warning(
@@ -1157,6 +1169,25 @@ class MotionBridge:
     # SET_FOLLOW 视觉跟随开关
     # ========================================================
 
+    def set_target_action(self, action: str):
+        """发送单人锁定指令: lock / relock / unlock。"""
+
+        if action not in ('lock', 'relock', 'unlock'):
+            raise ValueError(
+                f'invalid target action: {action}'
+            )
+
+        msg = String()
+        msg.data = json.dumps(
+            {'action': action},
+            separators=(',', ':'),
+        )
+        self._target_pub.publish(msg)
+
+        self.logger.info(
+            f'🎯 目标锁定指令: {action}'
+        )
+
     def set_follow(self, enable: bool):
         """开始/停止视觉跟随（公开接口）。
 
@@ -1171,6 +1202,10 @@ class MotionBridge:
         """
 
         if enable:
+            # 先锁定正前方的人，再 arm 安全桥。感知层收到 lock 后才会
+            # 发布目标；在其确认锁定前，跟随链路不会有速度。
+            self.set_target_action('lock')
+
             # 撤销还没执行的站立化请求
             self._stand_request_id += 1
 
@@ -1191,6 +1226,10 @@ class MotionBridge:
                     f'{self._current_motion or "未知"} '
                     '→ 请求切回 walk'
                 )
+
+        if not enable:
+            # 先解除锁定，让控制器立刻停发目标，再 disarm 安全桥。
+            self.set_target_action('unlock')
 
         msg = Bool()
         msg.data = bool(enable)

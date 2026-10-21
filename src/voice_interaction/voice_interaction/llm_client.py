@@ -1,6 +1,6 @@
 """阿里云 Qwen 大模型 + function call，理解用户意图并解析成机器人动作指令。
 
-模型 qwen-plus（质量/速度平衡，可换 qwen-turbo 更快更省 / qwen-max 更强）。
+默认 qwen-flash（低延迟；复杂问答可换 qwen-plus / qwen-max）。
 环境变量 DASHSCOPE_API_KEY 必须配置。
 
 文档：https://help.aliyun.com/zh/model-studio/use-qwen-by-calling-api
@@ -102,17 +102,25 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_follow",
-            "description": "开始或停止视觉跟随模式。开启后机器人会用摄像头识别并一直跟着人走。",
+            "description": "开始或停止单人锁定跟随。开启时锁定画面正前方的人并只跟着他/她，不会中途换人；停止时解除锁定。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "enable": {
                         "type": "boolean",
-                        "description": "true=开始跟随(跟着我/跟上我/过来跟着我)，false=停止跟随(停止跟随/别跟着我/原地停下别跟了)"
+                        "description": "true=开始跟随并锁定目标(跟着我/跟上我/过来跟着我)，false=停止跟随并解锁(停止跟随/别跟着我/原地停下别跟了)"
                     }
                 },
                 "required": ["enable"]
             }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "relock_target",
+            "description": "重新锁定跟随目标。锁定的人走丢、被挡住，或用户想改跟另一个人时使用；会重新选择画面正前方/最近的人。",
+            "parameters": {"type": "object", "properties": {}}
         }
     }
 ]
@@ -123,6 +131,8 @@ SYSTEM_PROMPT = """你是小智，一个智能人形机器人助手。
 视觉跟随规则（本机的主要行走方式）：
 - 用户说"跟着我/跟上我/开始跟随/过来跟着我" → 调用 set_follow(enable=true)，回复"好的，我跟上你了"
 - 用户说"停止跟随/别跟着我/原地别动" → 调用 set_follow(enable=false)，回复"好的，我停下等你"
+- 跟随会锁定一个人：锁定后不会中途换人；目标被挡住/走出画面会停下等待，不会改跟别人
+- 用户说"重新锁定/重新锁我/重新找我/重新跟着我" → 调用 relock_target，重新选择正前方的人
 - 用户问"你在干嘛/你怎么跟着我"这类问题时正常聊天回答，不要乱调工具
 
 机器人状态机规则：
@@ -141,7 +151,7 @@ SYSTEM_PROMPT = """你是小智，一个智能人形机器人助手。
 class LLMClient:
     """带对话历史的 Qwen 客户端。"""
 
-    def __init__(self, model='qwen-plus', max_history=10):
+    def __init__(self, model='qwen-flash', max_history=10):
         self.model = model
         self.max_history = max_history
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]

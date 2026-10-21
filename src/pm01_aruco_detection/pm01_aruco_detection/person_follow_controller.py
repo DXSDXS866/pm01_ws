@@ -9,7 +9,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from .person_follow_control import compute_follow_command, validate_limits
 
@@ -34,6 +34,8 @@ class PersonFollowController(Node):
         self.declare_parameter("turn_in_place_angle_rad", 0.60)
         self.declare_parameter("target_timeout_sec", 0.50)
         self.declare_parameter("max_source_age_sec", 0.50)
+        self.declare_parameter("detected_topic", "/person/detected")
+        self.declare_parameter("stop_on_detected_false", True)
 
         self.target_topic = str(self.get_parameter("target_topic").value)
         self.cmd_topic = str(self.get_parameter("cmd_topic").value)
@@ -50,6 +52,9 @@ class PersonFollowController(Node):
         self.turn_in_place_angle = float(self.get_parameter("turn_in_place_angle_rad").value)
         self.target_timeout = float(self.get_parameter("target_timeout_sec").value)
         self.max_source_age = float(self.get_parameter("max_source_age_sec").value)
+        self.detected_topic = str(self.get_parameter("detected_topic").value)
+        self.stop_on_detected_false = bool(
+            self.get_parameter("stop_on_detected_false").value)
         validate_limits(
             self.desired,
             self.min_distance,
@@ -72,7 +77,18 @@ class PersonFollowController(Node):
             self.on_target,
             qos_profile_sensor_data,
         )
+        # Perception publishes false as soon as the locked person is missing,
+        # so the robot stops one frame after losing the target instead of
+        # waiting for the 0.5 s position timeout.
+        self.create_subscription(
+            Bool,
+            self.detected_topic,
+            self.on_detected,
+            10,
+        )
         self.last_target_monotonic = None
+        self._target_valid = False
+        self._perception_ok = True
         self.last_state = "WAITING_FOR_TARGET"
         self.create_timer(0.05, self.on_timer)
         self.get_logger().info(
@@ -103,8 +119,25 @@ class PersonFollowController(Node):
     def publish_stop(self, state: str, reason: str, **extra) -> None:
         self.publish(0.0, 0.0, state, reason, **extra)
 
+    def on_detected(self, message: Bool) -> None:
+        """Stop immediately when perception says the locked person is gone."""
+        if not self.stop_on_detected_false:
+            return
+        self._perception_ok = bool(message.data)
+        if message.data:
+            return
+        was_active = self._target_valid or self.last_target_monotonic is not None
+        self._target_valid = False
+        self.last_target_monotonic = None
+        if was_active:
+            self.publish_stop("STOP_TARGET_LOST", "perception_detected_false")
+
     def on_target(self, message: PointStamped) -> None:
+        # Ignore any position that races with a detected=false transition.
+        if not self._perception_ok:
+            return
         if message.header.frame_id != self.required_frame:
+            self._target_valid = False
             self.last_target_monotonic = None
             self.publish_stop(
                 "STOP_FRAME_MISMATCH",
@@ -114,11 +147,13 @@ class PersonFollowController(Node):
 
         stamp = Time.from_msg(message.header.stamp)
         if stamp.nanoseconds <= 0:
+            self._target_valid = False
             self.last_target_monotonic = None
             self.publish_stop("STOP_INVALID_TIMESTAMP", "zero_source_stamp")
             return
         source_age = (self.get_clock().now() - stamp).nanoseconds / 1e9
         if source_age < -0.1 or source_age > self.max_source_age:
+            self._target_valid = False
             self.last_target_monotonic = None
             self.publish_stop(
                 "STOP_STALE_TARGET",
@@ -127,6 +162,7 @@ class PersonFollowController(Node):
             )
             return
 
+        self._target_valid = True
         forward = float(message.point.x)
         lateral = float(message.point.y)
         result = compute_follow_command(
@@ -163,6 +199,7 @@ class PersonFollowController(Node):
                 self.publish_stop("WAITING_FOR_TARGET", "no_valid_target")
             return
         if time.monotonic() - self.last_target_monotonic > self.target_timeout:
+            self._target_valid = False
             self.last_target_monotonic = None
             self.publish_stop("STOP_TARGET_TIMEOUT", "target_timeout")
 

@@ -103,13 +103,22 @@ FOLLOW_OFF_COMMANDS = (
     '停止',
 )
 
-# 开始跟随
+# 开始跟随（会同时锁定正前方的人）
 FOLLOW_ON_COMMANDS = (
     '跟着我',
     '开始跟随',
     '跟上我',
     '跟上来',
     '继续跟随',
+)
+
+# 重新锁定（必须在"开始跟随"之前匹配："重新跟着我"含"跟着我"）
+RELOCK_COMMANDS = (
+    '重新锁定',
+    '重新锁我',
+    '重新找我',
+    '重新找到我',
+    '重新跟着我',
 )
 
 
@@ -136,9 +145,11 @@ class VoiceInteractionNode(Node):
             500
         )
 
+        # 句尾静音：800ms 太保守，语音应答会明显慢半拍；
+        # 450ms 在展厅环境实测可用，抢话风险可用参数调回。
         self.declare_parameter(
             'silence_ms',
-            800
+            450
         )
 
         self.declare_parameter(
@@ -146,9 +157,11 @@ class VoiceInteractionNode(Node):
             -1
         )
 
+        # qwen-flash：实测首 token/function call 比 qwen-plus 快 0.3~1.1s，
+        # 手势/讲解工具调用已验证正常；复杂问答可改回 qwen-plus。
         self.declare_parameter(
             'llm_model',
-            'qwen-plus'
+            'qwen-flash'
         )
 
         self.declare_parameter(
@@ -159,6 +172,13 @@ class VoiceInteractionNode(Node):
         self.declare_parameter(
             'tts_voice',
             'longshu_v2'
+        )
+
+        # 流式 TTS：首包即播，显著降低首音延迟；
+        # 无 mpg123 时 TTSClient 会自动退回整段播放。
+        self.declare_parameter(
+            'tts_streaming',
+            True
         )
 
         # ====================================================
@@ -229,6 +249,11 @@ class VoiceInteractionNode(Node):
             self.get_parameter(
                 'tts_voice'
             ).value,
+
+            streaming=
+            self.get_parameter(
+                'tts_streaming'
+            ).value,
         )
 
         # ====================================================
@@ -250,10 +275,35 @@ class VoiceInteractionNode(Node):
 
         self._follow_active = False
 
+        # 语音侧请求的跟随状态（armed_source="voice"）。
+        # 目标暂时丢失时 _follow_active 会变成 False，
+        # 但守卫仍应拦截动作指令。
+        self._follow_requested = False
+
         self.create_subscription(
             String,
             '/vision_follow/safety_bridge_status',
             self._on_follow_status,
+            10,
+        )
+
+        # ====================================================
+        # 单人锁定状态（感知侧 /person/status）
+        #
+        # lock_state: OFF / PENDING / LOCKED / LOST / LEGACY
+        # 说"跟着我"后最多等 1.5 s 再播报锁定结果。
+        # ====================================================
+
+        self._person_status = {}
+        self._person_status_time = 0.0
+        self._person_status_cond = threading.Condition()
+        self._follow_cmd_generation = 0
+        self._follow_cmd_lock = threading.Lock()
+
+        self.create_subscription(
+            String,
+            '/person/status',
+            self._on_person_status,
             10,
         )
 
@@ -789,6 +839,16 @@ class VoiceInteractionNode(Node):
                     return ('gesture', gesture_id)
 
         # ------------------------------------------------
+        # 重新锁定先于停/开跟随："重新跟着我"含"跟着我"
+        # ------------------------------------------------
+
+        for keyword in RELOCK_COMMANDS:
+
+            if keyword in text:
+
+                return ('relock', None)
+
+        # ------------------------------------------------
         # 停跟随先于开跟随："别跟着我"含"跟着我"
         # ------------------------------------------------
 
@@ -831,6 +891,19 @@ class VoiceInteractionNode(Node):
                 True
             )
 
+        elif kind == 'relock':
+
+            self._direct_relock()
+
+    def _begin_follow_command(self):
+        with self._follow_cmd_lock:
+            self._follow_cmd_generation += 1
+            return self._follow_cmd_generation
+
+    def _follow_command_current(self, generation):
+        with self._follow_cmd_lock:
+            return generation == self._follow_cmd_generation
+
     def _direct_set_follow(
         self,
         enable: bool,
@@ -844,15 +917,81 @@ class VoiceInteractionNode(Node):
         # 停掉当前正在播的声音再执行
         self._stop_current_output()
 
-        self.bridge.set_follow(
-            enable
-        )
+        generation = self._begin_follow_command()
+
+        if enable:
+            self._follow_requested = True
+        else:
+            self._follow_requested = False
+
+        # 记录发指令的时间，只接受之后到达的锁定状态
+        since = time.monotonic()
+        self.bridge.set_follow(enable)
+
+        if not enable:
+            self.tts.speak('好的，我停下等你')
+            return
+
+        data = self._wait_for_lock(since, timeout=1.5)
+
+        # 期间用户又说了"停止跟随"，不再播报旧结果
+        if not self._follow_command_current(generation):
+            return
 
         self.tts.speak(
-            '好的，我跟上你了'
-            if enable
-            else '好的，我停下等你'
+            self._lock_feedback(data)
         )
+
+    @staticmethod
+    def _lock_feedback(data):
+        if not data or not data.get('lock_enabled', False):
+            return '好的，我跟上你了'
+
+        state = data.get('lock_state')
+
+        if state == 'LOCKED':
+            return (
+                '好的，我只跟着你'
+                if data.get('detected')
+                else '我看到你了，正在确认位置'
+            )
+
+        if state == 'PENDING':
+            return '请站到我正前方，我看到你就跟上'
+
+        if state == 'LOST':
+            return '我正在找你，请站到我正前方'
+
+        return '好的，我跟上你了'
+
+    def _direct_relock(self):
+
+        self.get_logger().info('🎯 直连重新锁定')
+        self._stop_current_output()
+
+        if not (
+            self._follow_requested
+            or self._follow_active
+        ):
+            self.tts.speak('请先对我说跟着我')
+            return
+
+        generation = self._begin_follow_command()
+        since = time.monotonic()
+        self.bridge.set_target_action('relock')
+        data = self._wait_for_lock(since, timeout=1.5)
+
+        if not self._follow_command_current(generation):
+            return
+
+        state = data.get('lock_state') if data else None
+
+        if state == 'LOCKED':
+            self.tts.speak('好的，我重新锁定你了')
+        elif state in ('PENDING', 'LOST'):
+            self.tts.speak('我正在重新找你，请站到正前方')
+        else:
+            self.tts.speak('重新锁定失败，请检查感知')
 
     def _direct_gesture(
         self,
@@ -874,10 +1013,10 @@ class VoiceInteractionNode(Node):
         # 跟随中禁止手势：行走中摆手臂会破坏平衡直接倒
         # ------------------------------------------------
 
-        if self._follow_active:
+        if self._follow_active or self._follow_requested:
 
             self.tts.speak(
-                '我正在行走，'
+                '我正在跟随，'
                 '请先说停止跟随，'
                 '站稳后我再做手势'
             )
@@ -945,11 +1084,85 @@ class VoiceInteractionNode(Node):
                 data.get('state') == 'FORWARDING'
             )
 
+            # 语音发起的跟随即使目标暂时丢失（armed 仍为 true）
+            # 也要算"跟随请求中"，动作守卫继续生效。
+            if data.get('armed_source') == 'voice':
+
+                self._follow_requested = bool(
+                    data.get('armed', False)
+                )
+
+            elif not data.get('armed', False):
+
+                self._follow_requested = False
+
         except Exception:
 
             # 解析不了就按"未跟随"处理，
             # 守卫放行，不影响原有动作链路
             self._follow_active = False
+
+    # ========================================================
+    # 单人锁定状态回调 / 等待
+    # ========================================================
+
+    def _on_person_status(
+        self,
+        msg,
+    ):
+
+        try:
+
+            data = json.loads(
+                msg.data
+            )
+
+        except Exception:
+
+            return
+
+        if not isinstance(data, dict):
+
+            return
+
+        with self._person_status_cond:
+
+            self._person_status = data
+            self._person_status_time = time.monotonic()
+            self._person_status_cond.notify_all()
+
+    def _wait_for_lock(
+        self,
+        since: float,
+        timeout: float = 1.5,
+    ):
+
+        deadline = time.monotonic() + timeout
+
+        with self._person_status_cond:
+
+            while True:
+
+                data = self._person_status
+
+                if (
+                    data
+                    and self._person_status_time >= since
+                    and data.get('lock_state')
+                    in ('LOCKED', 'LEGACY')
+                ):
+
+                    return dict(data)
+
+                remaining = deadline - time.monotonic()
+
+                if remaining <= 0:
+
+                    return dict(data) if data else {}
+
+                self._person_status_cond.wait(
+                    min(0.1, remaining)
+                )
 
     # ========================================================
     # 普通 LLM 对话
@@ -1042,7 +1255,10 @@ class VoiceInteractionNode(Node):
                 # ---------------------------------------------
 
                 if (
-                    self._follow_active
+                    (
+                        self._follow_active
+                        or self._follow_requested
+                    )
                     and tc['name']
                     in _FOLLOW_GUARDED_TOOLS
                 ):
@@ -1256,15 +1472,20 @@ class VoiceInteractionNode(Node):
 
         try:
 
-            # ------------------------------------------------
-            # 你的 TTSClient 里面已经有：
-            #
-            # self.player
-            #
-            # SpeakerPlayer 已经有 stop()
+            # TTSClient.stop() 会置流式停止标志、kill 播放进程，
+            # 并取消服务端剩余合成；SpeakerPlayer 同时也承载内置 MP3。
+            # 只调 player.stop() 的话，流式 TTS 可能在打断后又被
+            # 下一块音频重新启动。
             # ------------------------------------------------
 
             if hasattr(
+                self.tts,
+                'stop'
+            ):
+
+                self.tts.stop()
+
+            elif hasattr(
                 self.tts,
                 'player'
             ):

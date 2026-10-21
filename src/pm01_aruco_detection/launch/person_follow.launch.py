@@ -6,7 +6,7 @@ Pipeline:
     person_follow_controller
       -> /vision_follow/cmd_vel (isolated, never drives the robot directly)
     cmd_vel_safety_bridge (armed + motion-state + freshness gating)
-      -> /cmd_vel -> PM01 locomotion (运控主机 ros2_control_node subscribes here)
+      -> /cmd_vel -> PM01 locomotion (PM01 locomotion ros2_control_node subscribes here)
 
     body_vel_bridge (legacy, kept but inert): /motion/body_vel_cmd has zero
       subscribers on this SDK — verified 2026-08-31. The real velocity input
@@ -53,7 +53,23 @@ def generate_launch_description():
                 "armed",
                 default_value="false",
                 description="Safety bridge gate. false = bridge stays BLOCKED "
-                "and never publishes /cmd_vel.",
+                "and never publishes /cmd_vel. armed=true still requires a "
+                "locked person: perception publishes no target until the voice "
+                "command '跟着我' arrives on /person/set_target.",
+            ),
+            DeclareLaunchArgument(
+                "require_lock",
+                default_value="true",
+                description="Perception follows only a voice-locked person when "
+                "start_vision:=true. true = no target before '跟着我'.",
+            ),
+            DeclareLaunchArgument(
+                "detected_topic", default_value="/person/detected"),
+            DeclareLaunchArgument(
+                "stop_on_detected_false",
+                default_value="true",
+                description="Stop within one frame when perception reports the "
+                "locked person missing.",
             ),
             DeclareLaunchArgument(
                 "require_motion_state",
@@ -99,6 +115,9 @@ def generate_launch_description():
                     )
                 ),
                 condition=IfCondition(LaunchConfiguration("start_vision")),
+                launch_arguments={
+                    "require_lock": LaunchConfiguration("require_lock"),
+                }.items(),
             ),
             Node(
                 package="pm01_aruco_detection",
@@ -119,6 +138,10 @@ def generate_launch_description():
                             "turn_in_place_angle_rad"
                         ),
                         "target_timeout_sec": LaunchConfiguration("target_timeout_sec"),
+                        "detected_topic": LaunchConfiguration("detected_topic"),
+                        "stop_on_detected_false": LaunchConfiguration(
+                            "stop_on_detected_false"
+                        ),
                     }
                 ],
             ),

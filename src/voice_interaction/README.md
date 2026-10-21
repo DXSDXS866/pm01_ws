@@ -8,7 +8,8 @@ PM01-EDU 人形机器人的语音交互节点，部署在机器人计算单元�
 - 机器人计算单元上的 ROS2 Humble 环境（机器人自带）
 - `interface_protocol` msg 包（编译 Native SDK 时自动生成，路径 `engineai_robotics_native_sdk/src/protocol/interface_protocol`）
 - Python 依赖：`dashscope` `pyaudio` `numpy`，可选 `webrtcvad`
-- `ffmpeg`（含 ffplay，用于 MP3 播放）：`sudo apt install ffmpeg`
+- `ffmpeg`（含 ffplay，用于整段 MP3 播放回退路径）：`sudo apt install ffmpeg`
+- `mpg123`（推荐，用于流式 TTS 首包即播）：`sudo apt install mpg123`
 - 阿里云 DashScope API Key
 
 ## 目录结构
@@ -104,10 +105,11 @@ ros2 launch voice_interaction voice_interaction.launch.py
 | 参数 | 说明 | 调优建议 |
 |------|------|---------|
 | energy_threshold | VAD 能量阈值 | 先录环境噪声，设为其 RMS 的 2~3 倍。误触发就调高，听不到就调低 |
-| silence_ms | 句尾静音时长 | 说话慢的人调大(1000)，想快速响应调小(500) |
+| silence_ms | 句尾静音时长 | 默认 450；说话慢的人调大(800~1000)，想更快响应可再调小 |
 | mic_device_index | 麦克风索引 | -1=默认；`python3 -m sounddevice` 查列表 |
-| llm_model | LLM 模型 | qwen-plus 平衡；qwen-turbo 更快更省；qwen-max 更强 |
+| llm_model | LLM 模型 | 默认 qwen-flash（低延迟）；复杂问答可换 qwen-plus/qwen-max |
 | tts_voice | 发音人 | 换 tts_model 必须同步换 voice |
+| tts_streaming | 流式 TTS 播放 | 默认 true，首包即播；无 mpg123 或想回退旧行为时设 false |
 
 ## 动作接口（motion_bridge.py）
 
@@ -127,7 +129,7 @@ A: 按"部署步骤2"把 interface_protocol 放进工作区，或 source Native 
 A: 检查 DASHSCOPE_API_KEY 环境变量；`arecord test.wav` 确认麦克风有声；调低 energy_threshold。
 
 **Q: TTS 无声？**
-A: 确认装了 ffmpeg（ffplay）；cosyvoice-v3-flash 的 voice 必须是 longanhuan。
+A: 确认装了 `mpg123`（流式）和 `ffmpeg`（回退路径）；cosyvoice-v3-flash 的 voice 必须是 longanhuan。
 
 **Q: 机器人不动？**
 A: `ros2 topic echo /motion/motion_state` 看当前状态；walk 需先 pd_stand 再 rl_basic；检查 ROS_DOMAIN_ID=69。

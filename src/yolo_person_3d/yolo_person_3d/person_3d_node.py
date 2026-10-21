@@ -47,6 +47,16 @@ from tf2_ros import (
     TransformListener,
 )
 
+from yolo_person_3d.target_lock import (
+    Detection,
+    LOST as LOCK_STATE_LOST,
+    OFF as LOCK_STATE_OFF,
+    PENDING as LOCK_STATE_PENDING,
+    LockConfig,
+    PersonLock,
+    torso_histogram,
+)
+
 
 def _default_model_path() -> str:
     """Resolve the TensorRT engine from the installed share directory.
@@ -92,6 +102,18 @@ class Person3DNode(Node):
         self.declare_parameter("camera_mount_z_m", 0.0)
         self.declare_parameter("camera_mount_pitch_deg", 16.1)
 
+        # Single-person lock. With require_lock=true the node publishes no
+        # target until a {"action":"lock"} command arrives on
+        # target_command_topic; after that it follows only the locked person.
+        self.declare_parameter("target_command_topic", "/person/set_target")
+        self.declare_parameter("require_lock", True)
+        self.declare_parameter("lock_center_weight", 1.0)
+        self.declare_parameter("lock_depth_weight", 0.35)
+        self.declare_parameter("lock_track_color_max_dist", 0.55)
+        self.declare_parameter("lock_reacquire_color_max_dist", 0.40)
+        self.declare_parameter("lock_reacquire_confirm_frames", 2)
+        self.declare_parameter("lock_gap_reset_sec", 0.5)
+
         model_path = self.get_parameter("model_path").value
         self.target_frame = self.get_parameter("target_frame").value
         self.confidence = float(self.get_parameter("confidence").value)
@@ -113,12 +135,48 @@ class Person3DNode(Node):
         self.camera_mount_pitch = np.deg2rad(
             float(self.get_parameter("camera_mount_pitch_deg").value)
         )
+        self.target_command_topic = str(
+            self.get_parameter("target_command_topic").value)
+        self.require_lock = bool(self.get_parameter("require_lock").value)
+        lock_center_weight = float(
+            self.get_parameter("lock_center_weight").value)
+        lock_depth_weight = float(
+            self.get_parameter("lock_depth_weight").value)
+        lock_track_color_max_dist = float(
+            self.get_parameter("lock_track_color_max_dist").value)
+        lock_reacquire_color_max_dist = float(
+            self.get_parameter("lock_reacquire_color_max_dist").value)
+        lock_reacquire_confirm_frames = int(
+            self.get_parameter("lock_reacquire_confirm_frames").value)
+        lock_gap_reset_sec = float(
+            self.get_parameter("lock_gap_reset_sec").value)
         if not 0.0 < self.confidence <= 1.0:
             raise ValueError("confidence must be within (0, 1]")
         if not 0.0 < self.filter_alpha <= 1.0:
             raise ValueError("filter_alpha must be within (0, 1]")
         if min(self.max_jump_m, self.target_timeout, self.max_depth_age, self.max_rgb_depth_skew) <= 0.0:
             raise ValueError("jump and timeout parameters must be positive")
+        if not 0.0 < lock_track_color_max_dist <= 1.0:
+            raise ValueError("lock_track_color_max_dist must be within (0, 1]")
+        if not 0.0 < lock_reacquire_color_max_dist <= 1.0:
+            raise ValueError("lock_reacquire_color_max_dist must be within (0, 1]")
+        if lock_reacquire_confirm_frames < 1:
+            raise ValueError("lock_reacquire_confirm_frames must be >= 1")
+        if lock_gap_reset_sec <= 0.0:
+            raise ValueError("lock_gap_reset_sec must be positive")
+
+        self.lock = PersonLock(LockConfig(
+            center_weight=lock_center_weight,
+            depth_weight=lock_depth_weight,
+            track_color_max_dist=lock_track_color_max_dist,
+            reacquire_color_max_dist=lock_reacquire_color_max_dist,
+            reacquire_confirm_frames=lock_reacquire_confirm_frames,
+            gap_reset_sec=lock_gap_reset_sec,
+        ))
+        self._lock_reason = "UNLOCKED" if self.require_lock else "LEGACY"
+        self._lock_match_distance = None
+        self._num_persons = 0
+        self._prev_lock_state = LOCK_STATE_OFF
 
         if model_path.endswith(".engine"):
             # TensorRT engine runs on the GPU via pycuda (native sm_87). The
@@ -165,9 +223,15 @@ class Person3DNode(Node):
             PointStamped, self.robot_position_topic, qos_profile_sensor_data)
         self.detected_pub = self.create_publisher(Bool, "/person/detected", 10)
         self.status_pub = self.create_publisher(String, "/person/status", 10)
+        self.create_subscription(
+            String, self.target_command_topic, self.on_target_command, 10)
         self.get_logger().info(
             f"Waiting for color={self.color_topic}, depth={self.depth_topic}, "
             f"camera_info={self.camera_info_topic}"
+        )
+        self.get_logger().info(
+            f"Target lock: require_lock={self.require_lock}, "
+            f"commands on {self.target_command_topic}"
         )
 
     @staticmethod
@@ -223,13 +287,96 @@ class Person3DNode(Node):
         except Exception as exc:
             self.get_logger().error(f"depth conversion failed: {exc}")
 
+    def lock_status_fields(self):
+        if not self.require_lock:
+            return {
+                "lock_enabled": False,
+                "lock_state": "LEGACY",
+                "lock_reason": "LEGACY",
+                "lock_generation": 0,
+                "num_persons": self._num_persons,
+                "match_distance": None,
+            }
+        distance = self._lock_match_distance
+        return {
+            "lock_enabled": True,
+            "lock_state": self.lock.state,
+            "lock_reason": self._lock_reason,
+            "lock_generation": self.lock.generation,
+            "num_persons": self._num_persons,
+            "match_distance": (
+                round(float(distance), 3) if distance is not None else None),
+        }
+
+    def reset_target_filter(self):
+        """Drop position history so a new identity starts from a clean EMA."""
+        self.filtered_robot_xyz = None
+        self.last_target_monotonic = None
+        self.jump_rejections = 0
+
+    def on_target_command(self, msg):
+        """Handle {"action": "lock"|"relock"|"unlock"} from the voice stack."""
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            self.get_logger().warn(
+                f"invalid target command payload: {msg.data!r}",
+                throttle_duration_sec=2.0)
+            return
+
+        if isinstance(payload, dict):
+            action = str(payload.get("action", "")).strip().lower()
+        elif isinstance(payload, str):
+            action = payload.strip().lower()
+        else:
+            action = ""
+
+        if not self.require_lock:
+            if action == "unlock":
+                self.reset_target_filter()
+            self.get_logger().info(
+                f"target command '{action}' ignored (require_lock=false)")
+            return
+
+        if action == "lock":
+            self.lock.request_lock()
+            self.reset_target_filter()
+            self._lock_reason = "LOCK_REQUESTED"
+        elif action == "relock":
+            if self.lock.request_relock():
+                self.reset_target_filter()
+                self._lock_reason = "RELOCK_REQUESTED"
+            else:
+                self._lock_reason = "NO_LOCK"
+        elif action == "unlock":
+            self.lock.request_unlock()
+            self.reset_target_filter()
+            self._lock_reason = "UNLOCKED"
+            self._lock_match_distance = None
+            self.publish_status(False, "IDLE_UNLOCKED")
+            self.get_logger().info("Target lock released")
+            return
+        else:
+            self.get_logger().warn(
+                f"unknown target action: {action!r}",
+                throttle_duration_sec=2.0)
+            return
+
+        self.get_logger().info(f"Target lock command: {action}")
+        self.publish_status(False, "WAITING_FOR_LOCK")
+
     def publish_status(self, detected, state, **extra):
         detected_msg = Bool()
         detected_msg.data = bool(detected)
         self.detected_pub.publish(detected_msg)
         status = String()
         status.data = json.dumps(
-            {"detected": bool(detected), "state": state, **extra},
+            {
+                "detected": bool(detected),
+                "state": state,
+                **self.lock_status_fields(),
+                **extra,
+            },
             separators=(",", ":"),
         )
         self.status_pub.publish(status)
@@ -282,16 +429,64 @@ class Person3DNode(Node):
                               float(xyxy[2]), float(xyxy[3]),
                               float(b.conf[0].cpu())))
 
-        # Publish exactly one target per frame. Highest confidence avoids sending
-        # conflicting commands when multiple people are visible.
-        selected = max(boxes, key=lambda item: item[4]) if boxes else None
+        # Build per-person detections for the identity lock. Colour and depth
+        # samples are only needed in strict mode; legacy mode keeps the old
+        # highest-confidence behaviour.
+        detections = []
+        for (bx1, by1, bx2, by2, bconf) in boxes:
+            bbox = (bx1, by1, bx2, by2)
+            hist = (
+                torso_histogram(frame, bbox, self.lock.cfg)
+                if self.require_lock else None
+            )
+            depth_m = self.sample_box_depth(bbox) if self.require_lock else None
+            detections.append(Detection(bbox, bconf, depth_m, hist))
+
+        if self.require_lock:
+            lock_result = self.lock.update(
+                detections, frame.shape[1], frame.shape[0])
+            self._num_persons = lock_result.num_detections
+            self._lock_reason = lock_result.reason
+            self._lock_match_distance = lock_result.color_distance
+            selected_index = lock_result.selected_index
+            if (
+                lock_result.state == LOCK_STATE_LOST
+                and self._prev_lock_state != LOCK_STATE_LOST
+            ):
+                # Drop position history so a reappearing target is not blended
+                # with its pre-occlusion position.
+                self.reset_target_filter()
+            self._prev_lock_state = lock_result.state
+        else:
+            self._num_persons = len(boxes)
+            selected_index = (
+                max(range(len(boxes)), key=lambda i: boxes[i][4])
+                if boxes else None
+            )
+
+        selected = (
+            boxes[selected_index] if selected_index is not None else None)
+
+        if self.use_trt:
+            for index, (bx1, by1, bx2, by2, _bconf) in enumerate(boxes):
+                color = (
+                    (0, 255, 0) if index == selected_index else (150, 150, 150)
+                )
+                cv2.rectangle(annotated, (int(bx1), int(by1)),
+                              (int(bx2), int(by2)), color, 2)
+
         if selected is None:
-            self.mark_target_missing("NO_PERSON")
+            if not self.require_lock:
+                state = "NO_PERSON"
+            elif self.lock.state == LOCK_STATE_OFF:
+                state = "IDLE_UNLOCKED"
+            elif self.lock.state == LOCK_STATE_PENDING:
+                state = "WAITING_FOR_LOCK"
+            else:
+                state = "TARGET_LOST"
+            self.mark_target_missing(state)
         else:
             x1, y1, x2, y2, conf = selected
-            if self.use_trt:
-                cv2.rectangle(annotated, (int(x1), int(y1)),
-                              (int(x2), int(y2)), (0, 255, 0), 2)
             u = int(round((x1 + x2) / 2.0))
             v = int(round((y1 + y2) / 2.0))
             camera_xyz = self.pixel_to_3d(u, v)
@@ -361,6 +556,10 @@ class Person3DNode(Node):
                              f"Y={robot_xyz[1]:.2f} Z={robot_xyz[2]:.2f}m")
                 else:
                     label = "base_link XYZ unavailable"
+                if self.require_lock:
+                    label += f" [{self.lock.state}]"
+                    if self._lock_match_distance is not None:
+                        label += f" d={self._lock_match_distance:.2f}"
                 cv2.putText(annotated, label, (int(x1), max(20, int(y1) - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
             self.get_logger().info(
@@ -371,6 +570,28 @@ class Person3DNode(Node):
             cv2.imshow("YOLO person 3D", annotated)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 rclpy.shutdown()
+
+    def sample_box_depth(self, bbox):
+        """Return one median depth sample for a person box, or None."""
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0 or height <= 0:
+            return None
+        # Centre first (same point as the published position), then torso and
+        # legs. Dark clothing and head/hair often lack a valid depth return.
+        for fx, fy in (
+            (0.50, 0.50),
+            (0.50, 0.45),
+            (0.50, 0.75),
+            (0.50, 0.85),
+        ):
+            u = int(round(x1 + fx * width))
+            v = int(round(y1 + fy * height))
+            xyz = self.pixel_to_3d(u, v)
+            if xyz is not None:
+                return float(xyz[2])
+        return None
 
     def pixel_to_3d(self, u, v):
         if self.depth_image is None or self.camera_info is None:

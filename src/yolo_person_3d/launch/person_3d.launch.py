@@ -32,6 +32,23 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_mount_y_m", default_value="0.0"),
         DeclareLaunchArgument("camera_mount_z_m", default_value="0.0"),
         DeclareLaunchArgument("camera_mount_pitch_deg", default_value="16.1"),
+        DeclareLaunchArgument(
+            "require_lock",
+            default_value="true",
+            description="Publish no target until /person/set_target lock; "
+            "then follow only that person.",
+        ),
+        DeclareLaunchArgument(
+            "target_command_topic", default_value="/person/set_target"),
+        DeclareLaunchArgument("lock_center_weight", default_value="1.0"),
+        DeclareLaunchArgument("lock_depth_weight", default_value="0.35"),
+        DeclareLaunchArgument(
+            "lock_track_color_max_dist", default_value="0.55"),
+        DeclareLaunchArgument(
+            "lock_reacquire_color_max_dist", default_value="0.40"),
+        DeclareLaunchArgument(
+            "lock_reacquire_confirm_frames", default_value="2"),
+        DeclareLaunchArgument("lock_gap_reset_sec", default_value="0.5"),
         Node(
             package="yolo_person_3d",
             executable="person_3d_node",
@@ -45,6 +62,20 @@ def generate_launch_description():
                 "camera_mount_y_m": LaunchConfiguration("camera_mount_y_m"),
                 "camera_mount_z_m": LaunchConfiguration("camera_mount_z_m"),
                 "camera_mount_pitch_deg": LaunchConfiguration("camera_mount_pitch_deg"),
+                "require_lock": LaunchConfiguration("require_lock"),
+                "target_command_topic": LaunchConfiguration(
+                    "target_command_topic"),
+                "lock_center_weight": LaunchConfiguration(
+                    "lock_center_weight"),
+                "lock_depth_weight": LaunchConfiguration("lock_depth_weight"),
+                "lock_track_color_max_dist": LaunchConfiguration(
+                    "lock_track_color_max_dist"),
+                "lock_reacquire_color_max_dist": LaunchConfiguration(
+                    "lock_reacquire_color_max_dist"),
+                "lock_reacquire_confirm_frames": LaunchConfiguration(
+                    "lock_reacquire_confirm_frames"),
+                "lock_gap_reset_sec": LaunchConfiguration(
+                    "lock_gap_reset_sec"),
             }],
         ),
     ])
